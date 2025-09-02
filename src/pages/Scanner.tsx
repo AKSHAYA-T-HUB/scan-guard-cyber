@@ -13,6 +13,13 @@ export default function Scanner() {
   const { videoRef, state, startScanning, stopScanning, resetScanner } = useQRScanner();
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
+  // Auto-start camera when component mounts
+  useEffect(() => {
+    if (!state.isScanning && !state.hasPermission && !state.error) {
+      handleStartScan();
+    }
+  }, []);
+
   // Handle scan result
   useEffect(() => {
     if (state.result && !isAnalyzing) {
