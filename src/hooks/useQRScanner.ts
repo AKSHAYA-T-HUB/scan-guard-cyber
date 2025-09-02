@@ -26,11 +26,21 @@ export function useQRScanner() {
     }
 
     try {
+      // Reset state before starting
+      setState(prev => ({ ...prev, error: null, result: null }));
+
       // Check if QR scanner is supported
       const hasCamera = await QrScanner.hasCamera();
       if (!hasCamera) {
         setState(prev => ({ ...prev, error: 'No camera found on device' }));
         return;
+      }
+
+      // Stop any existing scanner
+      if (scannerRef.current) {
+        scannerRef.current.stop();
+        scannerRef.current.destroy();
+        scannerRef.current = null;
       }
 
       // Create scanner instance
@@ -63,9 +73,23 @@ export function useQRScanner() {
       
     } catch (error) {
       console.error('Scanner error:', error);
+      let errorMessage = 'Failed to start camera';
+      
+      if (error instanceof Error) {
+        if (error.message.includes('Permission denied')) {
+          errorMessage = 'Camera permission denied. Please allow camera access.';
+        } else if (error.message.includes('NotFoundError')) {
+          errorMessage = 'No camera found on this device.';
+        } else if (error.message.includes('NotAllowedError')) {
+          errorMessage = 'Camera access not allowed. Check your browser settings.';
+        } else {
+          errorMessage = error.message;
+        }
+      }
+      
       setState(prev => ({ 
         ...prev, 
-        error: error instanceof Error ? error.message : 'Failed to start camera',
+        error: errorMessage,
         isScanning: false 
       }));
     }

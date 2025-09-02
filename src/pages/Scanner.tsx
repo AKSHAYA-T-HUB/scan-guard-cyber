@@ -15,9 +15,15 @@ export default function Scanner() {
 
   // Auto-start camera when component mounts
   useEffect(() => {
-    if (!state.isScanning && !state.hasPermission && !state.error) {
-      handleStartScan();
-    }
+    const initializeCamera = async () => {
+      if (!state.isScanning && !state.hasPermission && !state.error) {
+        await handleStartScan();
+      }
+    };
+    
+    // Small delay to ensure video element is ready
+    const timer = setTimeout(initializeCamera, 100);
+    return () => clearTimeout(timer);
   }, []);
 
   // Handle scan result
