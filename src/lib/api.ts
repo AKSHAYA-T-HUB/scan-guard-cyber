@@ -1,10 +1,11 @@
-// API service for QR Scanner backend integration
+export type RiskLevel = 'safe' | 'warning' | 'danger';
+export type ScanType = 'url' | 'upi' | 'text';
 
 export interface ScanResult {
   id: string;
   content: string;
-  type: 'url' | 'upi' | 'text';
-  riskLevel: 'safe' | 'warning' | 'danger';
+  type: ScanType;
+  riskLevel: RiskLevel;
   verdict: string;
   reasons: string[];
   timestamp: string;
@@ -16,96 +17,148 @@ export interface ScanResult {
   };
 }
 
-export interface ApiResponse {
-  success: boolean;
-  data: ScanResult;
-  error?: string;
+const HISTORY_KEY = 'qr_scan_history';
+const HISTORY_LIMIT = 50;
+const SCAN_ENDPOINT = import.meta.env.VITE_SCAN_API_URL?.trim() || '/scan';
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }
 
-// Mock backend for demo - replace with actual FastAPI endpoint
-const MOCK_BACKEND_URL = '/api/scan'; // Replace with actual backend URL
-
-export async function analyzeScan(content: string): Promise<ScanResult> {
-  // Mock analysis for demo purposes
-  await new Promise(resolve => setTimeout(resolve, 2000)); // Simulate API delay
-  
-  const isUPI = content.startsWith('upi://');
-  const isURL = content.startsWith('http://') || content.startsWith('https://');
-  
-  let riskLevel: 'safe' | 'warning' | 'danger' = 'safe';
-  let reasons: string[] = [];
-  let verdict = '';
-  
-  if (isUPI) {
-    riskLevel = 'safe';
-    verdict = '✅ Safe Payment QR';
-    reasons = ['Verified UPI payment link', 'Safe to proceed with payment'];
-  } else if (isURL) {
-    // Mock risk analysis based on URL characteristics
-    const suspiciousPatterns = ['bit.ly', 'tinyurl', 'suspicious-domain'];
-    const hasSuspiciousPattern = suspiciousPatterns.some(pattern => 
-      content.toLowerCase().includes(pattern)
-    );
-    
-    if (hasSuspiciousPattern) {
-      riskLevel = 'danger';
-      verdict = '🚨 Risky URL Detected';
-      reasons = [
-        'Contains suspicious URL shorteners',
-        'Domain flagged in threat database',
-        'Potential phishing attempt'
-      ];
-    } else if (content.includes('http://')) {
-      riskLevel = 'warning';
-      verdict = '⚠️ Potentially Suspicious';
-      reasons = [
-        'Uses insecure HTTP protocol',
-        'SSL certificate not verified',
-        'Proceed with caution'
-      ];
-    } else {
-      riskLevel = 'safe';
-      verdict = '✅ URL Appears Safe';
-      reasons = [
-        'HTTPS secure connection',
-        'Domain verified',
-        'No suspicious patterns detected'
-      ];
-    }
-  } else {
-    verdict = '✅ Text Content Safe';
-    reasons = ['Plain text content', 'No security risks detected'];
+function firstValue(record: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    if (record[key] !== undefined && record[key] !== null) return record[key];
   }
-  
+  return undefined;
+}
+
+function asNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  return undefined;
+}
+
+function riskLevelFrom(value: unknown, record: Record<string, unknown>): RiskLevel {
+  const safeFlag = firstValue(record, ['is_safe', 'safe', 'isSafe']);
+  if (typeof safeFlag === 'boolean') return safeFlag ? 'safe' : 'danger';
+
+  const label = String(value ?? '').trim().toLowerCase();
+  if (/safe|clean|low risk|benign|trusted/.test(label)) return 'safe';
+  if (/suspicious|warning|medium|moderate|uncertain/.test(label)) return 'warning';
+  if (/risk|danger|malicious|phish|unsafe|high|critical/.test(label)) return 'danger';
+  throw new Error('The security service response did not include a recognizable risk verdict.');
+}
+
+function normalizeReasons(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      if (typeof item === 'string') return item;
+      const record = asRecord(item);
+      return String(record?.reason ?? record?.message ?? record?.name ?? 'Security check completed');
+    });
+  }
+  if (typeof value === 'string' && value.trim()) return [value];
+  return [];
+}
+
+function normalizeStats(value: unknown): ScanResult['analysisStats'] {
+  const record = asRecord(value);
+  if (!record) return undefined;
+
+  const stats = {
+    domainAge: asNumber(firstValue(record, ['domainAge', 'domain_age', 'domain_age_days'])),
+    sslExpiry: asNumber(firstValue(record, ['sslExpiry', 'ssl_expiry', 'ssl_expiry_days', 'ssl_days_remaining'])),
+    virusTotalScore: asNumber(firstValue(record, ['virusTotalScore', 'virustotal_score', 'virus_total_score'])),
+    suspiciousPatterns: asNumber(firstValue(record, ['suspiciousPatterns', 'suspicious_patterns', 'threat_count'])),
+  };
+  return Object.values(stats).some((item) => item !== undefined) ? stats : undefined;
+}
+
+function resultFromResponse(payload: unknown, content: string): ScanResult {
+  const root = asRecord(payload);
+  if (!root) throw new Error('The security service returned an unreadable response.');
+
+  const data = asRecord(root.data) ?? asRecord(root.result) ?? asRecord(root.analysis) ?? root;
+  const rawLevel = firstValue(data, ['riskLevel', 'risk_level', 'risk', 'verdict', 'status', 'classification']);
+  const riskLevel = riskLevelFrom(rawLevel, data);
+  const type: ScanType = content.trim().toLowerCase().startsWith('upi://')
+    ? 'upi'
+    : /^https?:\/\//i.test(content.trim()) ? 'url' : 'text';
+  const reasons = normalizeReasons(firstValue(data, ['reasons', 'findings', 'checks', 'details']));
+
   return {
-    id: Date.now().toString(),
+    id: crypto.randomUUID(),
     content,
-    type: isUPI ? 'upi' : isURL ? 'url' : 'text',
+    type,
     riskLevel,
-    verdict,
-    reasons,
+    verdict: String(firstValue(data, ['verdict', 'message', 'summary']) ?? (
+      riskLevel === 'safe' ? 'Safe' : riskLevel === 'warning' ? 'Suspicious' : 'Risky'
+    )),
+    reasons: reasons.length ? reasons : ['No additional details were provided by the security service.'],
     timestamp: new Date().toISOString(),
-    analysisStats: {
-      domainAge: Math.floor(Math.random() * 365) + 30,
-      sslExpiry: Math.floor(Math.random() * 90) + 1,
-      virusTotalScore: Math.floor(Math.random() * 100),
-      suspiciousPatterns: Math.floor(Math.random() * 5)
-    }
+    analysisStats: normalizeStats(firstValue(data, ['analysisStats', 'analysis_stats', 'stats', 'metadata'])),
   };
 }
 
-// Storage functions for scan history
+export async function analyzeScan(content: string): Promise<ScanResult> {
+  const response = await fetch(SCAN_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ content }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`The security service returned an error (${response.status}).`);
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error('The security service response was not valid JSON.');
+  }
+
+  return resultFromResponse(payload, content);
+}
+
+export function makePaymentResult(content: string): ScanResult {
+  return {
+    id: crypto.randomUUID(),
+    content,
+    type: 'upi',
+    riskLevel: 'safe',
+    verdict: '✅ Safe Payment QR',
+    reasons: ['UPI payment link detected. Confirm the recipient and amount in your payment app before paying.'],
+    timestamp: new Date().toISOString(),
+  };
+}
+
 export function getScanHistory(): ScanResult[] {
-  const stored = localStorage.getItem('qr_scan_history');
-  return stored ? JSON.parse(stored) : [];
+  try {
+    const stored = localStorage.getItem(HISTORY_KEY);
+    if (!stored) return [];
+    const parsed: unknown = JSON.parse(stored);
+    return Array.isArray(parsed) ? parsed as ScanResult[] : [];
+  } catch {
+    return [];
+  }
 }
 
 export function saveScanResult(result: ScanResult): void {
-  const history = getScanHistory();
-  const newHistory = [result, ...history.slice(0, 49)]; // Keep last 50 scans
-  localStorage.setItem('qr_scan_history', JSON.stringify(newHistory));
+  try {
+    const history = getScanHistory();
+    localStorage.setItem(HISTORY_KEY, JSON.stringify([result, ...history].slice(0, HISTORY_LIMIT)));
+  } catch {
+    // Scanning and results remain available if browser storage is disabled.
+  }
 }
 
 export function clearScanHistory(): void {
-  localStorage.removeItem('qr_scan_history');
+  try {
+    localStorage.removeItem(HISTORY_KEY);
+  } catch {
+    // Ignore unavailable browser storage.
+  }
 }
